@@ -1,0 +1,158 @@
+---
+title: "Weightlifting Exercise Prediction"
+output: html_document
+---
+```{r echo=FALSE, message=FALSE}
+library(randomForest)
+#We load the library here so that it doesn't get skipped due to caching
+```
+
+In this document we construct a machine learning model for predicting the version of an exercise performed (stored in the variable ```classe```) in the Weight Lifting Exercise data set [1]. We consider a variety of alternative types of models, but ultimately select a random forest [2] model based on an extremely low error rate (less than 1%) in cross-validation.  Our random forest model classifies all 20 test cases correctly.
+
+## Preprocessing
+
+We read the data into R, assuming that https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv has been downloaded to the working directory and given the filename ```pmltrain.csv```.
+
+```{r}
+train <- read.csv("pmltrain.csv",na.strings = c("NA",""))
+```
+
+The first variable is just an observation number, as the following demonstrates:                  
+```{r}
+a <- integer(0)
+for (i in 1:19622) {
+    if (train[i,1] != i) a<-c(a,i)
+    }
+a
+```
+We look at the first few variable names, with a view toward removing ones that should not be involved in our model.
+```{r}
+names(train)[1:10]
+```
+Variables 3, 4, and 5 are timestamps.  Also, variable 7 (```num_window```) appears to be related to the time that the measurement was taken, and in each window it appears that only a single exercise was performed, as the following shows:
+```{r}
+sub50 <- train[train$num_window<50,]
+table(sub50$num_window,sub50$classe)
+```
+
+It would be problematic to keep these variables in the data set, since they are correlated with classe in a way which cannot be expected to generalize to new examples.  Consequently we will remove these variables (and also ```new_window``` which is closely related to ```num_window```).  In the interest of generalizability we will also delete ```user_name``` (variable 2).
+
+Many of the variables are either of class ```NULL``` (with no entries at all), or have a very large number of ```NA``` values.  We find these with the following function:
+
+```{r}
+excessiveNA <- function(thresh) {
+    bad <- numeric(0)
+    for (i in 1:ncol(train)){
+        if (class(train[,i]) == "NULL" | sum(complete.cases(train[,i]))/nrow(train) < 1 - thresh) bad <- c(bad,i)
+        }
+    bad
+    }
+```
+
+We now  remove the variables 1-7 as mentioned above, as well as those with a proportion of NA values greater than 0.9.
+
+```{r}
+remove <- c(1:7,excessiveNA(.9))
+train <- train[,-remove]
+```
+
+## Cross-validation
+
+We will test the efficacy of a few different model types using k=8 cross-validation on the training set.  Based on the results of these tests we will select a method with which to train a model using the entire training set.
+
+First we split the training set into 8 pieces (arranged into a list ```cvtest```, so ```cvtest[[i]]``` is the ith part of the training set).  Corresponding to each of these 8 folds ```cvtest[[i]]``` we have the data frame ```cvtrain[[i]]``` consisting of the other 7 folds of the training set.
+
+```{r message=FALSE}
+library(caret)
+set.seed(2369)
+subs <- createFolds(train$classe,k=8)
+cvtrain <- lapply(1:8,function(i){train[-subs[[i]],] })
+cvtest <- lapply(1:8,function(i){train[subs[[i]],]})
+```
+
+The following function (with argument "met") returns the error rates for each of the 8 folds using k=8 cross-validation with the method met.
+While as default we use the ```train``` function from the ```caret``` package, for ```lda```, ```qda```, ```svm```, and randomForest we found that it saves time without sacrificing accuracy to call the method directly instead of using the ```train``` wrapper from ```caret```.
+
+```{r}
+tester <- function(met) {
+    accuracies <- numeric(0)
+    for (i in 1:8) {
+        if (met == "lda") {
+            library(MASS)
+            model <- lda(classe~.,data=cvtrain[[i]])
+            preds <- predict(model,cvtest[[i]])$class
+        }
+        else if (met == "qda") {
+            library(MASS)
+            model <- qda(classe~.,data=cvtrain[[i]])
+            preds <- predict(model,cvtest[[i]])$class
+        }        
+        else if (met == "rf") {
+            library(randomForest)
+            set.seed(2601)
+            model <- randomForest(classe~.,data=cvtrain[[i]],nodesize=10)
+#we use nodesize=10 to prevent the trees in the random forest from being too large, as without this parameter our system had insufficient memory.
+            preds <- predict(model,cvtest[[i]])
+        }
+        else if (met == "svm") {
+            library(e1071)
+            model <- svm(classe~.,data=cvtrain[[1]])
+            preds <- predict(model,cvtest[[i]])            
+        }
+        else{ 
+            model <- train(classe~.,data=cvtrain[[i]],method=met)
+            preds <- predict(model,cvtest[[i]])
+        }
+        accuracies[i] <- sum(preds == cvtest[[i]][,"classe"])/nrow(cvtest[[i]])
+    }
+    accuracies
+}
+```
+
+Here are the cross-validation accuracies for a few different methods:
+
+```{r cache=TRUE}
+tester("lda")
+tester("qda")
+tester("rpart")
+tester("svm")
+tester("rf")
+```
+
+Random forests ("rf") clearly gives the best performance in cross-validation.  We accodingly fit a random forest model for the entire training set:
+
+```{r cache=TRUE}
+set.seed(8047)
+mainModel <- randomForest(classe~.,data=train,nodesize=10)
+```
+
+Based on our cross-validation, in which the average error for the eight folds was `r mean(c(0.9971, 0.9931, 0.9918, 0.9939, 0.9971, 0.9967, 0.9955, 0.9959))`, we expect the out of sample error rate to be about 0.5%.
+
+## Applying the model to the test set
+
+We assume that the test set from https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv has been downloaded into the working directory as the file ```testfile.csv```, and we read this file into R:
+
+```{r}
+test <- read.csv("testfile.csv")
+```
+
+We remove the same variables from the test set as we did from the training set (which have been stored in the Preprocessing section as the vector ```remove```), and we also remove the last variable (```problem_id```), which has no analogue in the training set.
+
+```{r}
+test <- test[-c(remove,160)]
+```
+
+We can now use our main model to make our predictions on the test set.
+
+```{r message=FALSE}
+answers <- predict(mainModel,test)
+answers
+```
+
+Submitting these via the web submission form we find that all of the predictions are indeed correct.
+
+## References
+
+[1] Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. **Qualitative Activity Recognition of Weight Lifting Exercises**. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+[2] Breiman, Leo (2001). "Random Forests". *Machine Learning* **45** (1): 5-32.
